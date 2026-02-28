@@ -185,18 +185,36 @@ class PDFReportGenerator:
 
     def __init__(self, title: str = "Project Ajrasakha - Farmers Outreach Project"):
         self.title = title
-
+    
+        # Prefer NotoSans (better Unicode coverage than FreeSans)
+        regular = Path("assets/fonts/NotoSans-Regular.ttf")
+        bold    = Path("assets/fonts/NotoSans-Bold.ttf")
+    
         try:
-            font_path = Path("assets/fonts/FreeSans.ttf")
-            if font_path.exists():
-                pdfmetrics.registerFont(TTFont("FreeSans", str(font_path)))
-                self.font = "FreeSans"
+            if regular.exists():
+                pdfmetrics.registerFont(TTFont("NotoSans", str(regular)))
+                self.font = "NotoSans"
             else:
-                self.font = "Helvetica"
+                # fallback to FreeSans 
+                fs = Path("assets/fonts/FreeSans.ttf")
+                if fs.exists():
+                    pdfmetrics.registerFont(TTFont("FreeSans", str(fs)))
+                    self.font = "FreeSans"
+                else:
+                    self.font = "Helvetica"
         except Exception:
             self.font = "Helvetica"
-
-        self.header_font = "Helvetica-Bold"
+    
+        # Bold font registration
+        try:
+            if bold.exists():
+                pdfmetrics.registerFont(TTFont("NotoSans-Bold", str(bold)))
+                self.header_font = "NotoSans-Bold"
+            else:
+                # if no bold file, at least use same font for headers
+                self.header_font = self.font
+        except Exception:
+            self.header_font = "Helvetica-Bold"
 
     # ------------------------------------------------------------------
     # LAYOUT PRIMITIVES
@@ -231,7 +249,15 @@ class PDFReportGenerator:
     ) -> LongTable:
         """Boxed container that splits across pages (one flowable per row)."""
         if not flowables:
-            flowables = [Paragraph("No data available.", getSampleStyleSheet()["BodyText"])]
+            # flowables = [Paragraph("No data available.", getSampleStyleSheet()["BodyText"])]
+            fallback_style = ParagraphStyle(
+                "FallbackBody",
+                parent=getSampleStyleSheet()["BodyText"],
+                fontName=self.font,
+                fontSize=10,
+                leading=12,
+            )
+            flowables = [Paragraph("No data available.", fallback_style)]
 
         t = LongTable([[f] for f in flowables], colWidths=[width], splitByRow=1)
         t.setStyle(TableStyle([
@@ -412,8 +438,17 @@ class PDFReportGenerator:
 
         # ── Build story ──────────────────────────────────────────────────────
 
+        # story = [
+        #     Paragraph(self.title, styles["Title"]),
+        #     Spacer(1, 0.2 * inch),
+        # ]
+        title_style = ParagraphStyle(
+            "MyTitle",
+            parent=styles["Title"],
+            fontName=self.header_font,
+        )
         story = [
-            Paragraph(self.title, styles["Title"]),
+            Paragraph(_escape_for_para(self.title), title_style),
             Spacer(1, 0.2 * inch),
         ]
 
