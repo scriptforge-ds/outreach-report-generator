@@ -87,15 +87,3 @@ RULES:
         ]
 
         return self._run_inference(messages, max_new_tokens=450)
-
-
-
-# # =========================== Useage =====================================
-# from pipeline.extraction.conclusion import ConclusionGenerator
-
-# gen = ConclusionGenerator()  # or share base model instance
-# conclusion = await gen.generate(participants, challenges, questions, narration)
-
-# #==================Or if sharing the loaded model============================
-# base = NarrationGenerator()  # or any BaseLLM subclass already loaded
-# gen = ConclusionGenerator(base=base)  # if follow same pattern as MetadataExtractor

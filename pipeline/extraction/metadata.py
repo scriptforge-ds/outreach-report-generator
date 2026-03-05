@@ -1,14 +1,24 @@
 """
-Regex-first metadata extraction with optional LLM backfill (via BaseLLM).
+pipeline/extraction/metadata.py
 
-Design:
-- First pass: deterministic regex extraction (fast, stable).
-- Second pass (optional): LLM fills ONLY missing keys; never overwrites regex hits.
-- Final pass: strong post-processing to remove markdown/noise and to split
-  combined clauses like:
-    "under **Gardi Pharid Panchayat** in **Shri Chamkaur Sahib Block**"
+LLM-first metadata extraction with lightweight deterministic post-processing.
 
-This module is tuned for translated English transcripts produced by Ajsal's pipeline
+Goal
+----
+metadata is a small, well-defined schema (date, village, block, counts, etc.).
+Regex-only extraction is brittle because transcripts vary a lot. This extractor
+uses the LLM as the primary parser, and uses regex only as a *fallback* for
+missing fields.
+
+Behavior
+--------
+1) LLM extracts STRICT JSON for the schema from a relevant text window.
+2) Post-processing:
+   - normalize phone/time
+   - compute 'day' from 'date' if missing
+   - derive female_count = total - male when possible (and vice versa)
+   - split combined phrases where a field includes multiple places
+3) Fallback regex fills only missing keys (never overwrites LLM values).
 """
 
 from __future__ import annotations
@@ -20,12 +30,9 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from pipeline.extraction.base_llm import BaseLLM
+from pipeline.transcript.utils import format_transcript
 
 log = logging.getLogger(__name__)
-
-# =============================================================================
-# SCHEMA
-# =============================================================================
 
 SCHEMA: Dict[str, Any] = {
     "date": None,
@@ -46,6 +53,8 @@ SCHEMA: Dict[str, Any] = {
     "event_end_time": None,
 }
 
+HONORIFICS_RE = re.compile(r"^\s*(shri|smt|mr|mrs|ms|miss|dr)\.?\s+", re.I)
+
 NUMWORDS = {
     "zero": 0, "nil": 0, "none": 0,
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
@@ -54,457 +63,345 @@ NUMWORDS = {
     "nineteen": 19, "twenty": 20,
 }
 
-HONORIFICS_RE = re.compile(r"^\s*(shri|smt|mr|mrs|ms|miss|dr)\.?\s+", re.I)
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 
+def _ws(t: str) -> str:
+    return re.sub(r"\s+", " ", (t or "").replace("\n", " ")).strip()
 
-# =============================================================================
-# TEXT HELPERS
-# =============================================================================
-
-def normalize_text(t: str) -> str:
-    t = (t or "")
-    t = t.replace("\u2019", "'").replace("\u2018", "'")
-    t = t.replace("\u201c", '"').replace("\u201d", '"')
-    t = t.replace("\\ u", "\\u")               # fix broken escapes
-    t = re.sub(r"\\\s*u0A3C", "", t)           # remove marker seen in your data
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-def weekday_from_date(date_str: Optional[str]) -> Optional[str]:
-    if not date_str:
-        return None
-    s = str(date_str).strip()
-    # expected "YYYY-MM-DD"
-    try:
-        dt = datetime.strptime(s, "%Y-%m-%d")
-        return dt.strftime("%A")
-    except Exception:
-        return None
-
-def pick_relevant_window(text: str, window: int = 7000) -> str:
-    """
-    Metadata typically appears early in your narration.
-    We pick a window around the first occurrence of any key phrase.
-    """
-    t = (text or "")
-    tn = t.lower()
-    keys = [
-        "today", "date", "day",
-        "village", "panchayat", "block", "district",
-        "coordinator", "reporting manager", "sarpanch",
-        "phone",
-        "event start", "event end", "meeting location", "event location",
-        "farmers", "male farmers", "female farmers", "total farmers",
-    ]
-    idxs = [tn.find(k) for k in keys if tn.find(k) != -1]
-    if not idxs:
-        return t[:window]
-    i = max(min(idxs) - window // 2, 0)
-    return t[i:i + window]
-
-
-def first_match(patterns: List[str], text: str, flags=re.I) -> Optional[str]:
-    for p in patterns:
-        m = re.search(p, text, flags)
-        if m:
-            return (m.group(1) or "").strip()
-    return None
-
+def strip_markdown(s: str) -> str:
+    s = s or ""
+    s = re.sub(r"\*\*(.*?)\*\*", r"\1", s)      # **bold**
+    s = re.sub(r"`([^`]+)`", r"\1", s)          # inline code
+    s = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", s) # markdown links
+    return _ws(s)
 
 def clean_value(v: Any) -> Optional[str]:
     if v is None:
         return None
-    s = str(v).strip()
-    s = re.sub(r"[,\.;:\-]+$", "", s).strip()
-    return s if s else None
-
-
-def to_int_maybe(x: Any) -> Optional[int]:
-    if x is None:
-        return None
-    s = str(x).strip().lower()
-    if s.isdigit():
-        return int(s)
-    return NUMWORDS.get(s)
-
-
-# =============================================================================
-# SANITIZERS (markdown/noise, people, places, time)
-# =============================================================================
-
-def strip_markdown(s: str) -> str:
-    s = (s or "")
-    s = re.sub(r"\*\*", "", s)   # **bold**
-    s = re.sub(r"__", "", s)     # __underline__
-    s = s.replace("`", "")       # `code`
-    return s
-
-
-def clean_place(s: Any) -> Optional[str]:
-    if s is None:
-        return None
-    s = strip_markdown(str(s))
-    s = normalize_text(s)
-    s = s.strip(" ,.;:-")
-    if not s or s in ("*", "**"):
-        return None
-    # remove leading glue words
-    s = re.sub(r"^(under|in|at)\s+", "", s, flags=re.I).strip()
+    s = strip_markdown(str(v))
+    s = s.strip(" :-,")
+    s = _ws(s)
     return s or None
 
-
-def clean_person_name(s: Any, drop_honorifics: bool = True) -> Optional[str]:
-    if s is None:
-        return None
-    s = strip_markdown(str(s))
-    s = normalize_text(s).strip(" ,.;:-")
+def clean_place(v: Any) -> Optional[str]:
+    s = clean_value(v)
     if not s:
         return None
-    if drop_honorifics:
-        s = HONORIFICS_RE.sub("", s).strip()
-    s = re.sub(r"\s+", " ", s).strip()
+    # remove leading connectors
+    s = re.sub(r"^(in|at|near|under|within)\s+", "", s, flags=re.I).strip()
+    # remove trailing generic words
+    s = re.sub(r"\b(village|district|block|panchayat)\b$", "", s, flags=re.I).strip()
+    return _ws(s) or None
+
+def clean_person_name(v: Any) -> Optional[str]:
+    s = clean_value(v)
+    if not s:
+        return None
+    s = HONORIFICS_RE.sub("", s).strip()
+    # remove label tails
+    s = re.sub(r"\b(phone|mobile|number)\b.*$", "", s, flags=re.I).strip()
+    # title-case (simple)
+    s = " ".join(w.capitalize() for w in s.split())
     return s or None
 
-
-def normalize_phone(s: Any) -> Optional[str]:
-    if s is None:
+def normalize_phone(v: Any) -> Optional[str]:
+    if v is None:
         return None
-    digits = re.sub(r"\D", "", str(s))
-    if len(digits) >= 10:
-        return digits[-10:]
-    return None
-
-
-def normalize_time(t: Any) -> Optional[str]:
-    """
-    Convert formats like:
-      "11AM", "11:00AM", "11:00 AM", "1PM", "01:00 pm"
-    to:
-      "11:00 AM", "01:00 PM"
-    """
-    if t is None:
+    digits = re.sub(r"\D", "", str(v))
+    if len(digits) < 10:
         return None
-    s = strip_markdown(str(t))
-    s = normalize_text(s).upper().replace(" ", "")
+    return digits[-10:]
+
+def to_int_maybe(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v)
+    s = str(v).strip().lower()
+    if not s:
+        return None
+    # word numbers
+    if s in NUMWORDS:
+        return NUMWORDS[s]
+    m = re.search(r"\d+", s)
+    return int(m.group(0)) if m else None
+
+def normalize_time(v: Any) -> Optional[str]:
+    """
+    Normalize times to HH:MM (24h) when possible; else return cleaned string.
+    """
+    s = clean_value(v)
     if not s:
         return None
 
-    m = re.match(r"^(\d{1,2})(?::?(\d{2}))?(AM|PM)$", s)
+    # Common: "2:30 pm", "14:30", "2 pm"
+    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", s, re.I)
     if not m:
-        return clean_value(t)
+        return s
 
     hh = int(m.group(1))
     mm = int(m.group(2) or "00")
-    ap = m.group(3)
-    return f"{hh:02d}:{mm:02d} {ap}"
+    ampm = (m.group(3) or "").lower()
 
+    if ampm == "pm" and hh < 12:
+        hh += 12
+    if ampm == "am" and hh == 12:
+        hh = 0
+
+    if 0 <= hh <= 23 and 0 <= mm <= 59:
+        return f"{hh:02d}:{mm:02d}"
+    return s
+
+def weekday_from_date(date_str: Optional[str]) -> Optional[str]:
+    if not date_str:
+        return None
+    try:
+        # accept YYYY-MM-DD
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%A")
+    except Exception:
+        return None
+
+def pick_relevant_window(text: str, window: int = 7500) -> str:
+    """
+    Metadata usually appears near the beginning. Keep a window that includes
+    the start + any explicit "metadata / details" section if present.
+    """
+    t = text or ""
+    t = t.strip()
+    if len(t) <= window:
+        return t
+
+    anchors = [
+        r"\bmetadata\b",
+        r"\bmeeting details\b",
+        r"\bevent details\b",
+        r"\bdate\b",
+        r"\bvillage\b",
+        r"\bpanchayat\b",
+        r"\bblock\b",
+        r"\bdistrict\b",
+    ]
+    for a in anchors:
+        m = re.search(a, t, re.I)
+        if m and m.start() < len(t):
+            start = max(0, m.start() - 1200)
+            return t[start : start + window]
+    return t[:window]
+
+# ---------------------------------------------------------------------
+# Fallback regex (fills only missing keys)
+# ---------------------------------------------------------------------
+
+def _first_match(patterns: List[str], text: str) -> Optional[str]:
+    for p in patterns:
+        m = re.search(p, text, re.I)
+        if m:
+            return m.group(1).strip()
+    return None
+
+def extract_meta_regex(text: str) -> Dict[str, Any]:
+    t = text or ""
+    out: Dict[str, Any] = {}
+
+    date = _first_match([
+        r"\bdate\b\s*[:\-]?\s*(\d{4}-\d{2}-\d{2})\b",
+        r"\b(\d{2}/\d{2}/\d{4})\b",
+    ], t)
+    if date and "/" in date:
+        try:
+            d = datetime.strptime(date, "%d/%m/%Y").strftime("%Y-%m-%d")
+            date = d
+        except Exception:
+            pass
+    if date:
+        out["date"] = date
+
+    out["village"] = _first_match([r"\bvillage\b\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)"], t)
+    out["panchayat"] = _first_match([r"\bpanchayat\b\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)"], t)
+    out["block"] = _first_match([r"\bblock\b\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)"], t)
+    out["district"] = _first_match([r"\bdistrict\b\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)"], t)
+
+    phone = _first_match([r"\b(phone|mobile)\b\s*(?:number)?\s*[:\-]?\s*([+()\d\s\-]{8,})"], t)
+    if phone:
+        out["phone_number"] = phone
+
+    total = _first_match([r"\b(total|farmers attended)\b.*?(\d{1,4})\b"], t)
+    if total:
+        out["farmers_attended_total"] = total
+
+    male = _first_match([r"\bmale\b.*?(\d{1,4})\b"], t)
+    if male:
+        out["male_farmers_count"] = male
+
+    female = _first_match([r"\bfemale\b.*?(\d{1,4})\b"], t)
+    if female:
+        out["female_farmers_count"] = female
+
+    coord = _first_match([r"\bcoordinator\b\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)"], t)
+    if coord:
+        out["coordinator_name"] = coord
+
+    mgr = _first_match([r"\b(reporting manager|manager)\b\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)"], t)
+    if mgr:
+        out["reporting_manager_name"] = mgr
+
+    sar = _first_match([r"\bsarpanch\b\s*(?:name)?\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)"], t)
+    if sar:
+        out["sarpanch_name"] = sar
+
+    return out
+
+# ---------------------------------------------------------------------
+# Postprocess
+# ---------------------------------------------------------------------
 
 def _split_combined_places(meta: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Fix combined clauses often produced by LLM or run-on transcript:
-      village: "under Gardi Pharid Panchayat in Shri Chamkaur Sahib Block"
+    Sometimes one field contains a combined clause:
+      "Gardi Pharid Panchayat in Shri Chamkaur Sahib Block"
+    Split gently if obvious.
     """
-    m = dict(meta)
+    p = meta.get("panchayat")
+    b = meta.get("block")
 
-    village = m.get("village")
-    panchayat = m.get("panchayat")
-    block = m.get("block")
+    if p and (not b) and re.search(r"\bblock\b", p, re.I):
+        # attempt split: "... Panchayat ... Block ..."
+        m = re.search(r"(.+?)\b(block)\b\s*(.+)$", p, re.I)
+        if m:
+            left = clean_place(m.group(1))
+            right = clean_place(m.group(3))
+            if left:
+                meta["panchayat"] = left
+            if right:
+                meta["block"] = right
 
-    # If village contains "panchayat" or "block", split it.
-    if isinstance(village, str):
-        v = clean_place(village) or ""
-        v2 = re.sub(r"^\s*under\s+", "", v, flags=re.I).strip()
-        vl = v2.lower()
+    if b and re.search(r"\bpanchayat\b", b, re.I) and not p:
+        m = re.search(r"(.+?)\b(panchayat)\b\s*(.+)$", b, re.I)
+        if m:
+            left = clean_place(m.group(1))
+            right = clean_place(m.group(3))
+            if left:
+                meta["block"] = left
+            if right:
+                meta["panchayat"] = right
 
-        # Extract block name "... <BLOCK> Block"
-        mb = re.search(r"([A-Za-z][A-Za-z\s]+?)\s+block\b", v2, flags=re.I)
-        if mb and (not block or block in ("*", "**")):
-            m["block"] = mb.group(1).strip()
+    return meta
 
-        # Extract panchayat name "... <PANCHAYAT> Panchayat"
-        mp = re.search(r"([A-Za-z][A-Za-z\s]+?)\s+panchayat\b", v2, flags=re.I)
-        if mp and not panchayat:
-            m["panchayat"] = mp.group(1).strip()
+def postprocess_metadata(meta: Dict[str, Any], evidence_text: str = "") -> Dict[str, Any]:
+    out = dict(SCHEMA)
+    out.update(meta or {})
 
-        # Extract village candidate = before "Panchayat" if present
-        if "panchayat" in vl:
-            before_pan = re.split(r"\bpanchayat\b", v2, flags=re.I)[0].strip()
-            before_pan = re.sub(r"^\s*village\s+name\s*(?:is)?\s*", "", before_pan, flags=re.I).strip()
-            if before_pan:
-                m["village"] = before_pan
+    # --- normalize evidence text once ---
+    ev = (evidence_text or "")
 
-    # Clean panchayat if it contains "in ... block"
-    if isinstance(m.get("panchayat"), str):
-        p = clean_place(m["panchayat"])
-        if p:
-            p = re.sub(r"\s+in\s+.*?\bblock\b.*$", "", p, flags=re.I).strip()
-            p = re.sub(r"\bpanchayat\b", "", p, flags=re.I).strip()
-            m["panchayat"] = p or None
-        else:
-            m["panchayat"] = None
+    # basic cleaning
+    out["date"] = clean_value(out.get("date"))
+    out["day"] = clean_value(out.get("day"))
+    out["village"] = clean_place(out.get("village"))
+    out["panchayat"] = clean_place(out.get("panchayat"))
+    out["block"] = clean_place(out.get("block"))
+    out["district"] = clean_place(out.get("district"))
+    out["event_location"] = clean_place(out.get("event_location"))
 
-    # Clean block
-    if isinstance(m.get("block"), str):
-        b = clean_place(m["block"])
-        if b:
-            b = re.sub(r"\bblock\b", "", b, flags=re.I).strip()
-            m["block"] = b or None
-        else:
-            m["block"] = None
+    out["sarpanch_name"] = clean_person_name(out.get("sarpanch_name"))
+    out["coordinator_name"] = clean_person_name(out.get("coordinator_name"))
+    out["reporting_manager_name"] = clean_person_name(out.get("reporting_manager_name"))
 
-    # Event location: remove trailing "village"
-    if isinstance(m.get("event_location"), str):
-        el = clean_place(m["event_location"])
-        if el:
-            el = re.sub(r"\bvillage\b$", "", el, flags=re.I).strip()
-            m["event_location"] = el or None
-        else:
-            m["event_location"] = None
+    out["phone_number"] = normalize_phone(out.get("phone_number"))
 
-    # if event_location missing, fallback to village
-    if not m.get("event_location") and m.get("village"):
-        m["event_location"] = m["village"]
+    out["farmers_attended_total"] = to_int_maybe(out.get("farmers_attended_total"))
+    out["female_farmers_count"] = to_int_maybe(out.get("female_farmers_count"))
+    out["male_farmers_count"] = to_int_maybe(out.get("male_farmers_count"))
 
-    return m
-
-
-def postprocess_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Final cleanup step — removes markdown/noise and normalizes types/formatting.
-    """
-    m = dict(meta)
-
-    # places
-    for k in ("village", "panchayat", "block", "district", "event_location"):
-        m[k] = clean_place(m.get(k))
-
-    # split combined clause (critical for your issue)
-    m = _split_combined_places(m)
-
-    # names
-    m["sarpanch_name"] = clean_person_name(m.get("sarpanch_name"), drop_honorifics=True)
-    m["coordinator_name"] = clean_person_name(m.get("coordinator_name"), drop_honorifics=True)
-    m["reporting_manager_name"] = clean_person_name(m.get("reporting_manager_name"), drop_honorifics=True)
-
-    # phone
-    m["phone_number"] = normalize_phone(m.get("phone_number"))
-
-    # # counts -> int
-    # for k in ("farmers_attended_total", "female_farmers_count", "male_farmers_count"):
-    #     if m.get(k) is None:
-    #         continue
-    #     try:
-    #         m[k] = int(str(m[k]).strip())
-    #     except Exception:
-    #         m[k] = to_int_maybe(m[k])
+    out["event_start_time"] = normalize_time(out.get("event_start_time"))
+    out["event_end_time"] = normalize_time(out.get("event_end_time"))
 
     # ------------------------------------------------------------------
-    # CONSISTENCY FIX FOR FARMER COUNTS
+    # Evidence-based fixes (only fill missing values; never overwrite)
     # ------------------------------------------------------------------
-    
-    total = m.get("farmers_attended_total")
-    male = m.get("male_farmers_count")
-    female = m.get("female_farmers_count")
-    
-    # Ensure ints or None
-    total = int(total) if isinstance(total, int) else total
-    male = int(male) if isinstance(male, int) else male
-    female = int(female) if isinstance(female, int) else female
-    
+
+    # 1) DAY extraction when transcript contains "DAY THURSDAY" etc.
+    if (not out.get("day")) and ev:
+        m = re.search(r"\bday\b\s+([A-Za-z]+)\b", ev, flags=re.I)
+        if m:
+            out["day"] = m.group(1).strip().capitalize()
+
+    # 2) If date is still missing and you have a natural-date parser, use it
+    #    (safe: only fills when missing)
+    if (not out.get("date")) and ev:
+        try:
+            # parse_natural_date should return "YYYY-MM-DD" or None
+            d = parse_natural_date(ev)  # <-- must exist in your file; if not, remove this block
+            if d:
+                out["date"] = d
+        except NameError:
+            pass
+
+    # compute day from date if missing
+    if not out.get("day") and out.get("date"):
+        out["day"] = weekday_from_date(out["date"])
+
+    # 3) Explicit "no female" / "female nil/null/zero" => female_farmers_count = 0
+    #    only if still None (don’t override actual numbers)
+    if out.get("female_farmers_count") is None and ev:
+        if re.search(r"\b(no female|female\s+(nil|null|zero))\b", ev, flags=re.I):
+            out["female_farmers_count"] = 0
+
+    # derive missing gender counts when possible
+    total = out.get("farmers_attended_total")
+    male = out.get("male_farmers_count")
+    female = out.get("female_farmers_count")
+    if total is not None:
+        if female is None and male is not None:
+            out["female_farmers_count"] = max(total - male, 0)
+        if male is None and female is not None:
+            out["male_farmers_count"] = max(total - female, 0)
+    # if both missing but total exists, keep as None (do not guess)
     # Case 1: total + male known → derive female
     if total is not None and male is not None:
         derived = max(total - male, 0)
         if female is None:
-            m["female_farmers_count"] = derived
+            out["female_farmers_count"] = derived
     
     # Case 2: total + female known → derive male
     elif total is not None and female is not None:
         derived = max(total - female, 0)
         if male is None:
-            m["male_farmers_count"] = derived
+            out["male_farmers_count"] = derived
     
     # Case 3: female still None → default to 0
-    if m.get("female_farmers_count") is None:
-        m["female_farmers_count"] = 0
+    if out.get("female_farmers_count") is None:
+        out["female_farmers_count"] = 0
     
     # Case 4: male still None but total exists → assume all male
-    if m.get("male_farmers_count") is None and total is not None:
-        m["male_farmers_count"] = total
-
-    # times
-    m["event_start_time"] = normalize_time(m.get("event_start_time"))
-    m["event_end_time"] = normalize_time(m.get("event_end_time"))
-
-    # If day missing but date present, compute it
-    if not m.get("day") and m.get("date"):
-        m["day"] = weekday_from_date(m["date"])
-    # day capitalization
-    if m.get("day"):
-        m["day"] = clean_value(m["day"]).capitalize()
-
-    # remove junk markers
-    for k, v in list(m.items()):
-        if isinstance(v, str) and v.strip() in ("", "*", "**"):
-            m[k] = None
-
-    return m
+    if out.get("male_farmers_count") is None and total is not None:
+        out["male_farmers_count"] = total
 
 
-# =============================================================================
-# REGEX EXTRACTOR
-# =============================================================================
-
-def extract_meta_regex(text: str) -> Dict[str, Any]:
-    text = normalize_text(text)
-    out = dict(SCHEMA)
-
-    # Stop at comma/period/end OR when the next field label starts
-    STOP = r"(?=\s*(?:,|\.|$|\bvillage\b|\bpanchayat\b|\bblock\b|\bdistrict\b|\bcoordinator\b|\breporting\b|\bsarpanch\b|\bevent\b|\bphone\b))"
-
-    # date
-    out["date"] = clean_value(first_match([
-        rf"(?:today'?s\s+date\s*(?:is)?\s*)(.*?){STOP}",
-        rf"(?:\bdate\b\s*)(\d{{4}}-\d{{2}}-\d{{2}}){STOP}",
-        rf"(?:\bdate\b\s*)(\d{{1,2}}[\/\-]\d{{1,2}}[\/\-]\d{{2,4}}){STOP}",
-        rf"(?:\bdate\b\s*)([A-Za-z]+\s+\d{{1,2}},\s*\d{{4}}){STOP}",
-    ], text))
-
-    # day
-    # out["day"] = clean_value(first_match([
-    #     rf"(?:\bday\b\s*(?:is)?\s*)([A-Za-z]+){STOP}",
-    # ], text))
-    out["day"] = clean_value(first_match([
-        rf"(?:\bday\b\s*(?:is)?\s*)([A-Za-z]+){STOP}",
-        rf"(?:\btoday\b\s*(?:is)?\s*)(monday|tuesday|wednesday|thursday|friday|saturday|sunday){STOP}",
-    ], text))
-
-    # village / panchayat / block
-    out["village"] = clean_value(first_match([
-        rf"(?:village\s+name\s*(?:is)?\s*)(.*?){STOP}",
-        rf"(?:\bvillage\b\s*)(.*?){STOP}",
-    ], text))
-
-    out["panchayat"] = clean_value(first_match([
-        rf"(?:panchayat\s+name\s*(?:is)?\s*)(.*?){STOP}",
-        rf"(?:\bpanchayat\b\s*)(.*?){STOP}",
-    ], text))
-
-    # out["block"] = clean_value(first_match([
-    #     rf"(?:\bblock\b\s*(?:is)?\s*)(.*?){STOP}",
-    # ], text))
-    # out["block"] = out["block"] or clean_value(first_match([
-    #     rf"(?:\bblock\b\s*)([A-Za-z][A-Za-z\s]+?){STOP}",
-    # ], text))
-    # Block (IndicTrans2 often gives: "Block Shri Chamkaur Sahib Coordinator ...")
-    out["block"] = clean_value(first_match([
-        rf"\bblock\b\s*(?:name\s*)?(?:is\s*)?([A-Za-z][A-Za-z\s]+?){STOP}",
-        rf"\bblock\b\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+?){STOP}",
-        rf"\bblok\b\s*(?:nem|name)?\s*(?:is\s*)?([A-Za-z][A-Za-z\s]+?){STOP}",  # "Blok Nem"
-    ], text))
-
-    # names
-    out["coordinator_name"] = clean_value(first_match([
-        rf"(?:coordinator\s+name\s*(?:is)?\s*)(.*?){STOP}",
-        rf"(?:name\s+of\s+the\s+coordinator\s*)(.*?){STOP}",
-    ], text))
-
-    out["reporting_manager_name"] = clean_value(first_match([
-        rf"(?:reporting\s+manager\s*(?:name)?\s*(?:is)?\s*)(.*?){STOP}",
-        rf"(?:name\s+of\s+the\s+reporting\s+manager\s*)(.*?){STOP}",
-    ], text))
-
-    out["sarpanch_name"] = clean_value(first_match([
-        rf"(?:sarpanch\s+name\s*(?:is)?\s*)(.*?){STOP}",
-        rf"(?:name\s+of\s+the\s+sarpanch\s*)(.*?){STOP}",
-    ], text))
-
-    # location
-    out["event_location"] = clean_value(first_match([
-        rf"(?:meeting\s+location\s*)(.*?){STOP}",
-        rf"(?:event\s+location\s*)(.*?){STOP}",
-    ], text))
-
-    # district
-    out["district"] = clean_value(first_match([
-        rf"(?:\bdistrict\b\s*)(.*?){STOP}",
-    ], text))
-
-    # phone
-    phone_raw = first_match([
-        r"(?:phone\s+number\s*(?:is)?\s*)(\+?\d[\d\s]{8,}\d)",
-        r"(?:\bphone\b\s*(?:no|number)?\s*(?:is|:)?\s*)(\+?\d[\d\s]{8,}\d)",
-    ], text)
-    out["phone_number"] = normalize_phone(phone_raw)
-
-    # total farmers
-    tf = first_match([
-        r"number\s+of\s+total\s+farmers\s*\.\s*([A-Za-z]+|\d+)",
-        r"number\s+of\s+total\s+farmers\s*[:\-]?\s*([A-Za-z]+|\d+)",
-        r"\btotal\s+farmers\b\s*[:\-]?\s*([A-Za-z]+|\d+)",
-        r"\bno\s+of\s+farmers\s+attended\b\s*[:\-]?\s*([A-Za-z]+|\d+)",
-    ], text)
-    out["farmers_attended_total"] = to_int_maybe(tf)
-
-    # female / male farmers
-    female_raw = first_match([r"female\s+farmers\s*,?\s*(nil|none|\d+|[A-Za-z]+)"], text)
-    male_raw   = first_match([r"male\s+farmers\s*,?\s*(nil|none|\d+|[A-Za-z]+)"], text)
-
-    f_int = to_int_maybe(female_raw)
-    m_int = to_int_maybe(male_raw)
-
-    # Special-case: "male farmers, nil ... eight" -> choose last numeric token
-    m_clause = re.search(r"male\s+farmers([^\.]{0,80})", text, re.I)
-    if m_clause:
-        tail = m_clause.group(1).lower()
-        tokens = re.findall(
-            r"\b(nil|none|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d+)\b",
-            tail,
-        )
-        if tokens:
-            last_int = to_int_maybe(tokens[-1])
-            if tokens[0] in ("nil", "none", "zero") and last_int not in (None, 0):
-                m_int = last_int
-
-    out["female_farmers_count"] = f_int
-    out["male_farmers_count"] = m_int
-
-    # start time
-    ms = re.search(
-        r"(?:event\s+start(?:\s+time)?\s*(?:is)?\s*)(\d{1,2})(?::(\d{2}))?\s*(am|pm)",
-        text,
-        re.I,
-    )
-    if ms:
-        hh, mm, ap = ms.group(1), ms.group(2), ms.group(3).upper()
-        out["event_start_time"] = f"{hh}{(':' + mm) if mm else ''}{ap}"
-
-    # end time (sometimes "approximately")
-    me = re.search(
-        r"(?:event\s+end(?:\s+time)?\s*(?:is)?\s*(?:approximately)?\s*)(\d{1,2})(?::(\d{2}))?\s*(am|pm)",
-        text,
-        re.I,
-    )
-    if me:
-        hh, mm, ap = me.group(1), me.group(2), me.group(3).upper()
-        out["event_end_time"] = f"{hh}{(':' + mm) if mm else ''}{ap}"
-
-    # normalize times into consistent display
-    out["event_start_time"] = normalize_time(out.get("event_start_time"))
-    out["event_end_time"] = normalize_time(out.get("event_end_time"))
-
+    out = _split_combined_places(out)
     return out
 
-
 # =============================================================================
-# LLM BACKFILL PROMPT
+# LLM FILL PROMPT
 # =============================================================================
-
 def build_fill_prompt(en_text: str, current: Dict[str, Any]) -> str:
     return f"""
-Fill ONLY the missing fields for this JSON. Do not change existing values.
-Return ONLY one JSON object with the same keys as the schema.
-If still not present, keep null.
-Do NOT use markdown formatting (no **bold**, no bullets). Return plain text values only.
+You extract structured meeting metadata from a transcript.
+
+STRICT RULES:
+- Use ONLY facts explicitly present in the text.
+- If a value is unknown / not stated, return null.
+- Do NOT invent names/places/counts.
+- Do NOT include extra keys.
+- Prefer ISO date format YYYY-MM-DD when the date is explicit.
+- Phone number must be digits only (10 digits if possible); otherwise null.
+- If both male/female counts are not stated, keep them null (do not compute).
+- Return ONLY one JSON object with the same keys as the schema.
 
 Schema keys:
 {list(SCHEMA.keys())}
@@ -519,48 +416,42 @@ Return JSON only.
 """.strip()
 
 
-# =============================================================================
-# METADATA EXTRACTOR
-# =============================================================================
+# ---------------------------------------------------------------------
+# LLM-first extractor
+# ---------------------------------------------------------------------
 
 class MetadataExtractor(BaseLLM):
-    """
-    Regex-first metadata extractor with optional LLM backfill.
-    """
 
-    def __init__(self, base: Optional[BaseLLM] = None, device: Optional[str] = None):
-        if base is not None:
-            # share loaded model/tokenizer/device
-            self.model = base.model
-            self.tokenizer = base.tokenizer
-            self.device = base.device
+    async def extract(self, entries: List[Dict], use_llm: bool = True, **kwargs) -> Dict[str, Any]:
+        if isinstance(entries, str):
+            transcript = entries
         else:
-            super().__init__(device=device)
+            transcript = format_transcript(entries)
 
-    def extract(self, english_text: str, use_llm: bool = True, window: int = 7000) -> Dict[str, Any]:
-        win = pick_relevant_window(english_text, window=window)
-        base = extract_meta_regex(win)
+        window = pick_relevant_window(transcript, window=9000)
 
-        if use_llm and any(base.get(k) is None for k in SCHEMA.keys()):
-            try:
-                base = self._llm_fill_missing(win, base)
-            except Exception:
-                log.exception("LLM backfill failed; returning regex-only metadata.")
+        # IMPORTANT: seed "current" with the schema so LLM keeps exact keys
+        llm_meta = dict(SCHEMA)
 
-        # Always sanitize final output (fixes panchayat/block/location noise)
-        base = postprocess_metadata(base)
-        return base
+        if use_llm:
+            llm_meta = self._extract_llm(window, current=llm_meta)
 
-    def _llm_fill_missing(self, en_text: str, current: Dict[str, Any]) -> Dict[str, Any]:
-        prompt = build_fill_prompt(en_text, current)
+        llm_meta = postprocess_metadata(llm_meta, evidence_text=window)
+
+        # fallback regex fills only missing keys
+        regex_meta = extract_meta_regex(window)
+        for k, v in regex_meta.items():
+            if llm_meta.get(k) in (None, "", []):
+                llm_meta[k] = v
+
+        llm_meta = postprocess_metadata(llm_meta, evidence_text=window)
+        return llm_meta
+
+    def _extract_llm(self, text: str, current: Dict[str, Any]) -> Dict[str, Any]:
+        prompt = build_fill_prompt(text, current=current)
+
         messages = [{"role": "user", "content": prompt}]
+        decoded = self._run_inference(messages, max_new_tokens=550)
 
-        raw = self._run_inference(messages, max_new_tokens=450)
-        obj = self._safe_json(raw, fallback={})
-
-        merged = dict(current)
-        for k in SCHEMA.keys():
-            if merged.get(k) is None and obj.get(k) is not None:
-                merged[k] = obj.get(k)
-
-        return merged
+        # Always coerce to schema keys
+        return self._safe_json(decoded, dict(SCHEMA))

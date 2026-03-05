@@ -135,7 +135,8 @@ async def run_extraction(entries: list[dict], flores_lang: str) -> dict:
     participants     = await participant_extractor.extract(entries)
     terminology      = await terminology_task
     # metadata from the narration text (English)
-    metadata = metadata_extractor.extract(narration["narration"], use_llm=True)
+    # metadata = metadata_extractor.extract(narration["narration"], use_llm=True)
+    metadata = await metadata_extractor.extract(entries, use_llm=True)
 
     # final_summary = await summary_gen.generate(
     #     participants = participants,

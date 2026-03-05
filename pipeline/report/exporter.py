@@ -158,24 +158,48 @@ def participants_to_df(participants: Any) -> pd.DataFrame:
     return df
 
 
-# def flatten_challenges(challenges: List[Dict]) -> List[str]:
-#     """
-#     Convert [{"category": "...", "challenges": [...]}, ...]
-#     into a flat list of "Category: challenge" strings for bullet rendering.
-#     """
-#     out = []
-#     for group in coerce_list(challenges):
-#         if not isinstance(group, dict):
-#             out.append(str(group))
-#             continue
-#         cat   = safe(group.get("category", ""))
-#         items = coerce_list(group.get("challenges", []))
-#         for item in items:
-#             prefix = f"{cat}: " if cat else ""
-#             out.append(f"{prefix}{safe(item)}")
-#     return out
+_SENT_END = re.compile(r"(?s)(.*?[.!?])(\s+|$)")
 
+def paragraphize_long_text(text: str, style: ParagraphStyle, *, max_chunk_chars: int = 1400) -> List[Paragraph]:
+    """
+    - Keeps original paragraph breaks (\n\n)
+    - Only chunks very long paragraphs
+    - When chunking, prefers sentence boundaries so you don't get 'A' / half sentences.
+    """
+    text = safe(text)
+    if not text:
+        return []
 
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    out: List[Paragraph] = []
+
+    for block in blocks:
+        # chunk only if a single paragraph is huge
+        while len(block) > max_chunk_chars:
+            window = block[:max_chunk_chars]
+
+            # Prefer last sentence ending inside the window
+            cut = None
+            matches = list(_SENT_END.finditer(window))
+            if matches:
+                cut = matches[-1].end(1)
+
+            # Fallback: last space
+            if not cut or cut < 300:
+                sp = window.rfind(" ")
+                cut = sp if sp > 300 else max_chunk_chars
+
+            part = block[:cut].strip()
+            if part:
+                out.append(Paragraph(_escape_for_para(part), style))
+            block = block[cut:].strip()
+
+        if block:
+            out.append(Paragraph(_escape_for_para(block), style))
+
+    return out
 # =============================================================================
 # PDF REPORT GENERATOR
 # =============================================================================
@@ -259,9 +283,27 @@ class PDFReportGenerator:
             )
             flowables = [Paragraph("No data available.", fallback_style)]
 
+        # t = LongTable([[f] for f in flowables], colWidths=[width], splitByRow=1)
+        # t.setStyle(TableStyle([
+        #     ("BOX",            (0, 0), (-1, -1), 0.5, colors.black),
+        #     ("VALIGN",         (0, 0), (-1, -1), "TOP"),
+        #     ("LEFTPADDING",    (0, 0), (-1, -1), 6),
+        #     ("RIGHTPADDING",   (0, 0), (-1, -1), 6),
+        #     ("TOPPADDING",     (0, 0), (-1, -1), 3),
+        #     ("BOTTOMPADDING",  (0, 0), (-1, -1), 3),
+        # ]))
         t = LongTable([[f] for f in flowables], colWidths=[width], splitByRow=1)
         t.setStyle(TableStyle([
-            ("BOX",            (0, 0), (-1, -1), 0.5, colors.black),
+            # vertical borders always
+            ("LINEBEFORE",     (0, 0), (0, -1), 0.5, colors.black),
+            ("LINEAFTER",      (-1, 0), (-1, -1), 0.5, colors.black),
+        
+            # IMPORTANT: draw top border at start of EACH split fragment
+            ("LINEABOVE",      (0, 0), (-1, 0), 0.5, colors.black),
+        
+            # IMPORTANT: draw bottom border at end of EACH split fragment
+            ("LINEBELOW",      (0, -1), (-1, -1), 0.5, colors.black),
+        
             ("VALIGN",         (0, 0), (-1, -1), "TOP"),
             ("LEFTPADDING",    (0, 0), (-1, -1), 6),
             ("RIGHTPADDING",   (0, 0), (-1, -1), 6),
@@ -398,6 +440,7 @@ class PDFReportGenerator:
             fontName=self.font,
             leading=14,
             fontSize=10,
+            spaceAfter=6,
         )
 
         # ── Unpack report dict ───────────────────────────────────────────────
@@ -533,68 +576,29 @@ class PDFReportGenerator:
         story.append(meta_tbl)
         story.append(Spacer(1, 0.2 * inch))
 
-        # table_data = [
-        #     ["Date",                         safe(meta.get("date", "")),
-        #      "Day",                          safe(meta.get("day", ""))],
-        #     ["Village",                      extract_parenthetical(meta.get("village")),
-        #      "Name of the Sarpanch",         extract_parenthetical(meta.get("sarpanch_name"))],
-        #     ["Panchayat",                    extract_parenthetical(meta.get("panchayat")),
-        #      "Phone Number",                 safe(meta.get("phone_number", ""))],
-        #     ["Block",                        extract_parenthetical(meta.get("block")),
-        #      "Event Location",               extract_parenthetical(meta.get("event_location"))],
-        #     ["District",                     extract_parenthetical(meta.get("district")),
-        #      "No of Farmers attended",       total],
-        #     ["Name of the Coordinator",      extract_parenthetical(meta.get("coordinator_name")),
-        #      "Female Farmers",               female],
-        #     ["Name of the Reporting Manager",extract_parenthetical(meta.get("reporting_manager_name")),
-        #      "Male Farmers",                 male],
-        #     ["Event Start Time",             normalize_time(safe(meta.get("event_start_time", ""))),
-        #      "Event End Time",               normalize_time(safe(meta.get("event_end_time", "")))],
-        # ]
-
-        # meta_tbl = Table(
-        #     table_data,
-        #     colWidths=[2.1 * inch, 1.6 * inch, 2.1 * inch, 1.6 * inch],
-        #     style=TableStyle([
-        #         ("GRID",       (0, 0), (-1, -1), 0.5, colors.black),
-        #         ("FONTNAME",   (0, 0), (-1, -1), self.font),
-        #         ("FONTSIZE",   (0, 0), (-1, -1), 9),
-        #         ("BACKGROUND", (0, 0), (0, -1),  colors.whitesmoke),
-        #         ("BACKGROUND", (2, 0), (2, -1),  colors.whitesmoke),
-        #         ("FONTNAME",   (0, 0), (0, -1),  self.header_font),
-        #         ("FONTNAME",   (2, 0), (2, -1),  self.header_font),
-        #         ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
-        #         ("PADDING",    (0, 0), (-1, -1), 4),
-        #     ]),
-        # )
-        # story.append(meta_tbl)
-        # story.append(Spacer(1, 0.2 * inch))
 
         # ── Detailed Narration ───────────────────────────────────────────────
 
         story.append(self._boxed_header("Detailed Narration of the Interaction:"))
+        
         narration_content = []
+        
         if narration_text:
-            narration_content.append(
-                Paragraph("<b>Translation / Dictation:</b>", styles["Heading4"])
-            )
-            narration_html = _escape_for_para(
-                strip_markdown(narration_text)
-            ).replace("\n", "<br/>")
-            narration_content.append(Paragraph(narration_html, body_style))
+            narration_content.append(Paragraph("<b>Translation / Dictation:</b>", styles["Heading4"]))
+        
+            # IMPORTANT: build many Paragraphs (many rows) so the box can split
+            narr_clean = strip_markdown(narration_text)
+            narration_content.extend(paragraphize_long_text(narr_clean, body_style, max_chunk_chars=900))
         else:
-            narration_content.append(
-                Paragraph("No narration available.", body_style)
-            )
+            narration_content.append(Paragraph("No narration available.", body_style))
+        
         if summary_text:
             narration_content.append(Spacer(1, 8))
             narration_content.append(Paragraph("<b>Summary:</b>", styles["Heading4"]))
-            narration_content.append(
-                Paragraph(_escape_for_para(strip_markdown(summary_text)), body_style)
-            )
+            narration_content.extend(paragraphize_long_text(strip_markdown(summary_text), body_style, max_chunk_chars=900))
+        
         story.append(self._boxed_body_splittable(narration_content))
         story.append(Spacer(1, 0.2 * inch))
-
         # ── Key Challenges ───────────────────────────────────────────────────
 
         # story.append(self._boxed_header("Key Challenges Shared by the farmers:"))
@@ -861,9 +865,12 @@ class PDFReportGenerator:
         conclusion = safe(data.get("conclusion", "")) or summary_text
         if conclusion:
             story.append(self._boxed_header("Conclusion"))
-            story.append(self._boxed_body_splittable([
-                Paragraph(_escape_for_para(strip_markdown(conclusion)), body_style)
-            ]))
+            # story.append(self._boxed_body_splittable([
+            #     Paragraph(_escape_for_para(strip_markdown(conclusion)), body_style)
+            # ]))
+            body_paras = paragraphize_long_text(strip_markdown(conclusion), body_style, max_chunk_chars=900) or \
+                         [Paragraph("No conclusion available.", body_style)]
+            story.append(self._boxed_body_splittable(body_paras))
 
         doc.build(story)
         return output_path

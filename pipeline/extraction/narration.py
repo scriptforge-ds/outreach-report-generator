@@ -70,7 +70,7 @@ Transcript:
 """,
             },
         ]
-        return self._run_inference(messages, max_new_tokens=150).strip()
+        return self._run_inference(messages, max_new_tokens=300).strip()
 
     def _generate_narration(self, transcript: str) -> str:
         messages = [
@@ -93,7 +93,7 @@ Transcript:
 """,
             },
         ]
-        return self._run_inference(messages, max_new_tokens=600).strip()
+        return self._run_inference(messages, max_new_tokens=1200).strip()
 
 
 # =============================================================================
@@ -170,4 +170,4 @@ RULES:
 """,
             },
         ]
-        return self._run_inference(messages, max_new_tokens=600)
+        return self._run_inference(messages, max_new_tokens=900)
