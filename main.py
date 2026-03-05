@@ -5,10 +5,9 @@ Single entry point for the full outreach report pipeline:
 
   audio files (directory)
       → combine & normalize    [pipeline/ingestion/audio_utils.py]
-      → speaker diarization    [pipeline/diarization/pyannote_diarizer.py]
-      → ASR transcription      [pipeline/asr/indic_conformer.py]
+      → ASR + diarization      [pipeline/asr/sarvam_asr.py]
       → structured transcript  [pipeline/transcript/builder.py]
-      → translation            [pipeline/translation/sarvam_translate.py]
+      → translation            [pipeline/translation/indictrans2.py]
       → extraction & insights  [pipeline/extraction/*]
       → assemble & save        [pipeline/report/assembler.py]
 
@@ -72,35 +71,17 @@ def run_ingestion(input_dir: str, combined_wav: str) -> str:
 def run_asr_diarization(
     combined_wav: str,
     language_asr: str,
-    device: str,
+    flores_lang:  str,
+    device:       str,
 ) -> list[dict]:
-    from pipeline.asr.indic_conformer import load_asr_model
-    from pipeline.diarization.pyannote_diarizer import diarize, load_diarization_pipeline
-    from pipeline.transcript.builder import build_transcript
+    from pipeline.asr.sarvam_asr import transcribe_and_diarize
 
-    log.info("── STAGE 2: Speaker diarization ──")
-    diarization_pipeline = load_diarization_pipeline(device)
-    turns = diarize(diarization_pipeline, combined_wav)
-
-    del diarization_pipeline
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    log.info("── STAGE 3: ASR transcription ──")
-    asr_model  = load_asr_model(device)
-    transcript = build_transcript(
-        audio_path = combined_wav,
-        turns      = turns,
-        asr_model  = asr_model,
-        language   = language_asr,
-        device     = device,
+    log.info("── STAGES 2+3: ASR + diarization + translation (Sarvam Saaras v3) ──")
+    return transcribe_and_diarize(
+        audio_path  = combined_wav,
+        flores_lang = flores_lang,
+        mode        = "translate",  # transcribe + translate to English in one shot
     )
-
-    del asr_model
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    return transcript
 
 
 def run_translation(
@@ -108,16 +89,9 @@ def run_translation(
     flores_lang: str,
     device:      str,
 ) -> list[dict]:
-    from pipeline.translation.sarvam_translate import SarvamTranslator
-
-    log.info("── STAGE 4: Translation (Indic → English) ──")
-    translator = SarvamTranslator(device=device)
-    translator.translate_transcript(entries, src_lang=flores_lang)
-
-    del translator
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
+    # Translation is done by Sarvam inside run_asr_diarization() with mode="translate".
+    # This function is kept so --skip_asr resumption still works correctly.
+    log.info("── STAGE 4: Translation already done by Sarvam — skipping ──")
     return entries
 
 
